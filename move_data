@@ -1,0 +1,343 @@
+#!/bin/bash
+
+#Description: MOVE DATA to tapes of new STGPOOL
+#Author     : randomhive
+#Date       : 2022-12-19
+
+function usage ()
+{
+        echo "script to move tape data to new stgpool";
+        echo "usage  : $0 -i <tsm_instance> -s <stgpool_name> [-m <mediatype>] [-p <pct_utilized>] [-v <volume_name>]";
+        echo "         [-M <max_proc>] [-w <start>-<end> -M <max_proc> -I <idle_proc>]";
+        echo "";
+        echo "options:";
+        echo "  -i  TSM server instance name (required, e.g. tsminst1)";
+        echo "  -s  stgpool name (required)";
+        echo "  -m  mediatype filter, comma-separated without spaces (e.g. 3592-JC,3592-JD)";
+        echo "      uses libvolumes join when set";
+        echo "  -p  max pct_utilized threshold (volumes with PCT_UTILIZED < value)";
+        echo "  -v  volume name filter (exact name or SQL LIKE pattern, e.g. A%)";
+        echo "  -M  max move data processes (fixed limit, or during time window with -w)";
+        echo "  -w  active time window as start-end hours (24h, e.g. 20-2 for 20:00-01:59)";
+        echo "      requires -M and -I; outside window idle_proc limit applies";
+        echo "  -I  max move data processes outside time window (required with -w)";
+        echo "";
+        echo "without -M and -w: no process limit check, each run starts a new move when possible";
+        echo "";
+        echo "example: $0 -i tsminst1 -s POOL_SOURCE -m 3592-JD -p 80 -v A%";
+        echo "example: $0 -i tsminst1 -s POOL_SOURCE -M 6";
+        echo "example: $0 -i tsminst1 -s POOL_SOURCE -w 20-2 -M 8 -I 2";
+}
+
+WORK_DIR=~/scripts/move_data
+TSM_CREDFILE=$WORK_DIR/tsm_cred
+TSM_LOG=$WORK_DIR/tsm_tapes.out
+TSM_VOLUMES=$WORK_DIR/tsm_tapes.volumes
+
+TSM_INSTANCE=""
+STGPOOL=""
+MEDIATYPE=""
+PCT_UTILIZED=""
+VOLUME_NAME=""
+TIME_WINDOW=""
+MAX_PROC=""
+IDLE_PROC=""
+VOLUME=""
+LAST_TSM_OUTPUT=""
+LAST_TSM_RC=""
+DEBUG_STDOUT=0
+[ -t 1 ] && DEBUG_STDOUT=1
+
+function log_msg ()
+{
+        local msg="$1"
+        local ts
+        ts=$(date +%Y%m%d_%H:%M:%S)
+        if [ "$DEBUG_STDOUT" -eq 1 ]; then
+                echo "${ts} ${msg}"
+        fi
+        echo "${ts} ${msg}" >> "$TSM_LOG"
+}
+
+function run_tsm_cmd ()
+{
+        local cmd="$1"
+        local output rc
+        output=$(dsmadmc -se="$TSM_INSTANCE" -comma -dataonly=yes -credentialsfile="$TSM_CREDFILE" "$cmd" 2>&1)
+        rc=$?
+        LAST_TSM_OUTPUT="$output"
+        LAST_TSM_RC=$rc
+        if [ -n "$output" ]; then
+                log_tsm_output "$output"
+        fi
+        return $rc
+}
+
+function filter_tsm_noise ()
+{
+        echo "$1" | grep -v 'ANS0990W.*Options file.*dsm\.opt' | sed '/^[[:space:]]*$/d'
+}
+
+function log_tsm_output ()
+{
+        local output filtered
+        output="$1"
+        if [ -z "$output" ]; then
+                return
+        fi
+        filtered=$(filter_tsm_noise "$output")
+        if [ -z "$filtered" ]; then
+                return
+        fi
+        if [ "$DEBUG_STDOUT" -eq 1 ]; then
+                printf '%s\n' "$filtered"
+        fi
+        printf '%s\n' "$filtered" >> "$TSM_LOG"
+}
+
+function filter_tsm_data ()
+{
+        echo "$1" | grep -v -E '^(ANS|ANR)' | sed '/^[[:space:]]*$/d'
+}
+
+function run_tsm_query ()
+{
+        local cmd="$1"
+        local output data warnings
+        output=$(dsmadmc -se="$TSM_INSTANCE" -comma -dataonly=yes -credentialsfile="$TSM_CREDFILE" "$cmd" 2>&1)
+        LAST_TSM_OUTPUT="$output"
+        warnings=$(echo "$output" | grep -E '^(ANS|ANR)' || true)
+        warnings=$(filter_tsm_noise "$warnings")
+        if [ -n "$warnings" ]; then
+                log_tsm_output "$warnings"
+        fi
+        data=$(filter_tsm_data "$output")
+        echo "$data"
+}
+
+function log_tsm_failure ()
+{
+        local action="$1"
+        local volume="$2"
+        local output="$3"
+        local rc="$4"
+
+        if echo "$output" | grep -q 'ANR2405E'; then
+                log_msg "skip volume=$volume in use by clients or data management, upd vol not possible"
+                return
+        fi
+        if echo "$output" | grep -q 'ANR2416E'; then
+                log_msg "skip volume=$volume move data already in progress"
+                return
+        fi
+        log_msg "ERROR $action failed volume=$volume rc=$rc"
+}
+
+function format_mediatype_in ()
+{
+        local input="$1"
+        if [[ "$input" == \(* ]]; then
+                echo "$input"
+                return
+        fi
+        local IFS=','
+        local types=($input)
+        local quoted=""
+        local t
+        for t in "${types[@]}"; do
+                quoted="${quoted}'${t}',"
+        done
+        echo "(${quoted%,})"
+}
+
+function build_volume_query ()
+{
+        local volume_filter=""
+        local pct_filter=""
+
+        if [ -n "$VOLUME_NAME" ]; then
+                if [[ "$VOLUME_NAME" == *"%"* || "$VOLUME_NAME" == *"_"* ]]; then
+                        volume_filter=" AND v.VOLUME_NAME LIKE '$VOLUME_NAME'"
+                else
+                        volume_filter=" AND v.VOLUME_NAME = '$VOLUME_NAME'"
+                fi
+        fi
+
+        if [ -n "$PCT_UTILIZED" ]; then
+                pct_filter=" AND v.PCT_UTILIZED < $PCT_UTILIZED"
+        fi
+
+        if [ -n "$MEDIATYPE" ]; then
+                local mediatype_in
+                mediatype_in=$(format_mediatype_in "$MEDIATYPE")
+                echo "SELECT v.VOLUME_NAME FROM volumes v JOIN libvolumes l ON v.VOLUME_NAME = l.VOLUME_NAME WHERE v.STGPOOL_NAME = '$STGPOOL' AND l.MEDIATYPE IN ${mediatype_in}${pct_filter}${volume_filter} ORDER BY v.PCT_UTILIZED"
+                return
+        fi
+
+        volume_filter=""
+        pct_filter=""
+        if [ -n "$VOLUME_NAME" ]; then
+                if [[ "$VOLUME_NAME" == *"%"* || "$VOLUME_NAME" == *"_"* ]]; then
+                        volume_filter=" AND VOLUME_NAME LIKE '$VOLUME_NAME'"
+                else
+                        volume_filter=" AND VOLUME_NAME = '$VOLUME_NAME'"
+                fi
+        fi
+        if [ -n "$PCT_UTILIZED" ]; then
+                pct_filter=" AND PCT_UTILIZED < $PCT_UTILIZED"
+        fi
+
+        echo "SELECT VOLUME_NAME FROM volumes WHERE stgpool_name = '$STGPOOL'${pct_filter}${volume_filter} ORDER BY PCT_UTILIZED"
+}
+
+function in_time_window ()
+{
+        local start=$1
+        local end=$2
+        local hour=$3
+
+        if [ "$start" -gt "$end" ]; then
+                [ "$hour" -ge "$start" ] || [ "$hour" -lt "$end" ]
+        else
+                [ "$hour" -ge "$start" ] && [ "$hour" -lt "$end" ]
+        fi
+}
+
+function get_max_num_proc ()
+{
+        if [ -z "$TIME_WINDOW" ]; then
+                echo "$MAX_PROC"
+                return
+        fi
+
+        local window_start=${TIME_WINDOW%-*}
+        local window_end=${TIME_WINDOW#*-}
+        local hour
+        hour=$(date +%H)
+        hour=$((10#$hour))
+
+        if in_time_window "$window_start" "$window_end" "$hour"; then
+                echo "$MAX_PROC"
+        else
+                echo "$IDLE_PROC"
+        fi
+}
+
+while getopts "i:s:m:p:v:w:M:I:h" opt; do
+        case $opt in
+                i) TSM_INSTANCE="$OPTARG" ;;
+                s) STGPOOL="$OPTARG" ;;
+                m) MEDIATYPE="$OPTARG" ;;
+                p) PCT_UTILIZED="$OPTARG" ;;
+                v) VOLUME_NAME="$OPTARG" ;;
+                w) TIME_WINDOW="$OPTARG" ;;
+                M) MAX_PROC="$OPTARG" ;;
+                I) IDLE_PROC="$OPTARG" ;;
+                h) usage; exit 0 ;;
+                *) usage; exit 1 ;;
+        esac
+done
+
+if [ -z "$TSM_INSTANCE" ] || [ -z "$STGPOOL" ]; then
+        usage
+        exit 1
+fi
+
+if [ -n "$PCT_UTILIZED" ] && ! [[ "$PCT_UTILIZED" =~ ^[0-9]+$ ]]; then
+        log_msg "ERROR pct_utilized must be a number: $PCT_UTILIZED"
+        exit 1
+fi
+
+if [ -n "$TIME_WINDOW" ]; then
+        if ! [[ "$TIME_WINDOW" =~ ^[0-9]{1,2}-[0-9]{1,2}$ ]]; then
+                log_msg "ERROR time window must be start-end hours (e.g. 20-2): $TIME_WINDOW"
+                exit 1
+        fi
+        window_start=${TIME_WINDOW%-*}
+        window_end=${TIME_WINDOW#*-}
+        if [ "$window_start" -lt 0 ] || [ "$window_start" -gt 23 ] || [ "$window_end" -lt 0 ] || [ "$window_end" -gt 23 ]; then
+                log_msg "ERROR time window hours must be 0-23: $TIME_WINDOW"
+                exit 1
+        fi
+        if [ -z "$MAX_PROC" ] || [ -z "$IDLE_PROC" ]; then
+                log_msg "ERROR time window requires -M <max_proc> and -I <idle_proc>"
+                exit 1
+        fi
+        if ! [[ "$MAX_PROC" =~ ^[0-9]+$ ]] || ! [[ "$IDLE_PROC" =~ ^[0-9]+$ ]]; then
+                log_msg "ERROR max_proc and idle_proc must be numbers"
+                exit 1
+        fi
+elif [ -n "$MAX_PROC" ]; then
+        if ! [[ "$MAX_PROC" =~ ^[0-9]+$ ]]; then
+                log_msg "ERROR max_proc must be a number: $MAX_PROC"
+                exit 1
+        fi
+elif [ -n "$IDLE_PROC" ]; then
+        log_msg "ERROR -I requires -w <time window>"
+        exit 1
+fi
+
+RANDOM=$$$(date +%s)
+
+VOLUME_QUERY=$(build_volume_query)
+MAX_NUM_PROC=$(get_max_num_proc)
+
+ISPROCESS=`ps -ef| grep "server/bin/dsmserv" | grep -i "$TSM_INSTANCE" | grep -v grep | wc -l`
+if [ $ISPROCESS -ne 1 ]; then
+        log_msg "ERROR instance $TSM_INSTANCE not running on this host ($HOSTNAME)"
+        exit 1
+fi
+
+log_msg "starting instance=$TSM_INSTANCE stgpool=$STGPOOL mediatype=${MEDIATYPE:-none} pct_utilized=${PCT_UTILIZED:-none} volume_name=${VOLUME_NAME:-any}"
+
+if [ -n "$TIME_WINDOW" ]; then
+        if [ "$MAX_NUM_PROC" = "$MAX_PROC" ]; then
+                log_msg "process limit active window=$TIME_WINDOW max=$MAX_PROC (current hour in window)"
+        else
+                log_msg "process limit idle window=$TIME_WINDOW max=$IDLE_PROC (current hour outside window)"
+        fi
+elif [ -n "$MAX_PROC" ]; then
+        log_msg "process limit max=$MAX_PROC"
+else
+        log_msg "process limit none"
+fi
+
+if [ ! -r "$TSM_CREDFILE" ]; then
+        log_msg "ERROR cannot read credentials file: $TSM_CREDFILE"
+        exit 1
+fi
+
+NUM_PROC=$(run_tsm_query "select count(*) from processes where PROCESS='Move Data'" | tail -1 | tr -d '[:space:]')
+
+if ! [[ "$NUM_PROC" =~ ^[0-9]+$ ]]; then
+        log_msg "ERROR invalid process count from tsm: ${NUM_PROC:-empty}"
+        exit 1
+fi
+
+if [ -n "$MAX_NUM_PROC" ] && [ "$NUM_PROC" -ge "$MAX_NUM_PROC" ]; then
+        log_msg "skip max move data processes reached: $NUM_PROC/$MAX_NUM_PROC"
+        exit 1
+fi
+
+VOLUMES=(`run_tsm_query "$VOLUME_QUERY"`)
+NEXT_STGPOOL=$(run_tsm_query "select NEXTSTGPOOL from STGPOOLS where stgpool_name = '$STGPOOL'" | tail -1 | tr -d '[:space:]')
+VOLUME=${VOLUMES[$RANDOM % ${#VOLUMES[@]}]}
+
+if [[ "$VOLUME" =~ [A-Z][0-9]{5} ]] && [[ "$NEXT_STGPOOL" != "" ]]; then
+        log_msg "move data volume=$VOLUME from=$STGPOOL to=$NEXT_STGPOOL"
+        if run_tsm_cmd "upd vol $VOLUME access=readonly"; then
+                if run_tsm_cmd "move data $VOLUME stg=$NEXT_STGPOOL"; then
+                        echo "$VOLUME" >> "$TSM_VOLUMES"
+                        log_msg "started move data volume=$VOLUME from=$STGPOOL to=$NEXT_STGPOOL"
+                else
+                        log_tsm_failure "move data" "$VOLUME" "$LAST_TSM_OUTPUT" "$LAST_TSM_RC"
+                fi
+        else
+                log_tsm_failure "upd vol" "$VOLUME" "$LAST_TSM_OUTPUT" "$LAST_TSM_RC"
+        fi
+else
+        log_msg "no tape to move found in stgpool=$STGPOOL"
+fi
+
+log_msg "end"
+exit 0
